@@ -6,6 +6,8 @@ Everything that can be computed is computed here, not by the LLM:
   lock      freeze the human-confirmed requirements (sha256)
   collect   git diff -> hunks + deterministic signals (diff.json, diff.patch)
   validate  check contract.json against lock + diff.json (exit 1 on any error)
+  reviewer-pack     single paste-able file for an independent review in any other tool
+  import-contract   save the reviewer's reply as contract.json
   render    report.md with a computed risk level and ranked decisions
   decide    record a human decision (keep|revert|discuss)
   gate      exit 0 only if validate passes and every decision is `keep`
@@ -690,6 +692,7 @@ def cmd_render(a) -> int:
     if errs:
         L.append("\n> DRAFT - contract has validation errors; do not trust this report.")
     L.append(f"\n{con.get('summary_plain', '')}")
+    L.append(f"\n_Reviewer: {con.get('reviewed_by', 'subagent/unspecified')}_")
     L.append(f"\n## 1. Decisions for you ({len(decs)})\n")
     if not decs:
         L.append("None. Every change maps to a requirement and no risky signal fired.")
@@ -753,6 +756,66 @@ def cmd_render(a) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- reviewer pack (tool-neutral review)
+
+PACK_PREAMBLE = """# Independent review task (paste this whole file into a FRESH chat/session)
+
+Use a different session from the one that wrote the code, ideally a different model.
+The inputs below REPLACE the file paths mentioned in the prompt. You cannot browse the repo:
+rely on the patch, and record any context you wished you had as an assumption.
+OVERRIDE of rule 8: do not write files. Reply with ONLY the complete contract.json content in a
+single ```json block and nothing else.
+
+---
+
+"""
+
+
+def cmd_reviewer_pack(a) -> int:
+    ctx = Ctx(a.task)
+    req = load(ctx.p("requirements.json"))
+    diff = load(ctx.p("diff.json"))
+    prompt_file = Path(__file__).resolve().parent.parent / "references" / "reviewer-prompt.md"
+    if not prompt_file.exists():
+        die(f"missing {prompt_file}")
+    prompt = prompt_file.read_text(encoding="utf-8").split("\n", 2)[2]  # drop title + blank line
+    prompt = prompt.replace("{DIR}/", "the ").replace("{REPO}", "(not available)")
+    patch = ctx.p("diff.patch").read_text(encoding="utf-8")
+    fence = "`" * 3
+    parts = [PACK_PREAMBLE, prompt,
+             f"\n\n---\n\n## Input 1: requirements.json (locked)\n\n{fence}json\n",
+             json.dumps(req, indent=2, ensure_ascii=False),
+             f"\n{fence}\n\n## Input 2: diff.json\n\n{fence}json\n",
+             json.dumps(diff, indent=1, ensure_ascii=False),
+             f"\n{fence}\n\n## Input 3: diff.patch\n\n{fence}diff\n", patch, f"\n{fence}\n"]
+    out = ctx.p("reviewer-pack.md")
+    text = "".join(parts)
+    out.write_text(text, encoding="utf-8")
+    kb = len(text.encode("utf-8")) // 1024
+    print(f"wrote {out} ({kb} KB)")
+    if kb > 300:
+        print("warn: large pack; some chat UIs will truncate it. Consider splitting the change into smaller tasks.")
+    print("paste it into a fresh session, save the reply to a file, then: cdiff import-contract <file>")
+    return 0
+
+
+def cmd_import_contract(a) -> int:
+    ctx = Ctx(a.task)
+    raw = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.S)
+    body = m.group(1) if m else raw[raw.find("{"): raw.rfind("}") + 1]
+    try:
+        con = json.loads(body)
+    except json.JSONDecodeError as e:
+        die(f"could not find valid JSON in the reply: {e}")
+    if not isinstance(con, dict) or "mappings" not in con:
+        die("JSON found, but it does not look like a contract (no `mappings`)")
+    con["reviewed_by"] = a.reviewer or "external-session"
+    save(ctx.p("contract.json"), con)
+    print(f"saved contract.json (reviewed_by={con['reviewed_by']}); next: cdiff validate")
+    return 0
+
+
 # ---------------------------------------------------------------- status
 
 
@@ -781,8 +844,11 @@ def main() -> int:
     p.add_argument("--allow-dirty", action="store_true")
     p = sub.add_parser("lock")
     p.add_argument("--confirmed", action="store_true", help="human has approved requirements.json")
-    for n in ("collect", "validate", "gate", "status"):
+    for n in ("collect", "validate", "gate", "status", "reviewer-pack"):
         sub.add_parser(n)
+    p = sub.add_parser("import-contract")
+    p.add_argument("file", help="file with the reviewer's reply, or - for stdin")
+    p.add_argument("--reviewer", help="who reviewed, e.g. 'gpt-5 fresh chat'")
     p = sub.add_parser("render")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("decide")
@@ -790,7 +856,7 @@ def main() -> int:
     p.add_argument("choice", choices=["keep", "revert", "discuss"])
     p.add_argument("--note")
     a = ap.parse_args()
-    fn = globals()[f"cmd_{a.cmd}"]
+    fn = globals()["cmd_" + a.cmd.replace("-", "_")]
     return fn(a) or 0
 
 
